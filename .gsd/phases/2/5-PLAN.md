@@ -31,15 +31,15 @@ Implement password reset flow (token, email, update, session invalidation), emai
          - Store userId in the Redis value
          - Log audit (PASSWORD_RESET_REQUESTED)
          - In production: send email (for now, log the token to console)
-       - `auth.service.confirmPasswordReset(token, newPassword)`:
-         - Hash the token, look up in Redis
-         - If not found: throw BadRequestException (expired or invalid)
-         - Hash new password with argon2
-         - Update user password in PostgreSQL
-         - Delete the reset token from Redis
-         - Invalidate ALL user sessions in MongoDB
-         - Blacklist all active access tokens for this user in Redis
-         - Log audit (PASSWORD_RESET_COMPLETED)
+        - `auth.service.confirmPasswordReset(token, newPassword)`:
+          - Hash the token, look up in Redis
+          - If not found: throw BadRequestException (expired or invalid)
+          - Hash new password with argon2
+          - **CRITICAL**: Update user password AND **increment user.token_version** in PostgreSQL
+            - The increment instantly invalidates all existing JWTs for this user
+          - Delete the reset token from Redis
+          - Invalidate ALL user sessions in MongoDB (bulk update isActive=false, revokedReason='PASSWORD_RESET')
+          - Log audit (PASSWORD_RESET_COMPLETED)
 
     2. Email Verification:
        - `auth.service.requestEmailVerification(userId)`:
@@ -92,19 +92,31 @@ Implement password reset flow (token, email, update, session invalidation), emai
          - Log audit (MFA_DISABLED)
 
     2. Login flow integration (update auth.service.login):
-       - If user.is_mfa_enabled === true after password verification:
-         - Generate a temporary MFA token (short-lived, 5min, signed with JWT_ACCESS_SECRET)
-         - Store temp token reference in Redis with key `mfa-pending:{tempTokenId}` userId, TTL 5min
-         - Return { mfaRequired: true, tempToken } instead of full token pair
-         - DO NOT create session yet
+        - If user.is_mfa_enabled === true after password verification:
+          - **Generate a temporary MFA token** (short-lived, 5min):
+            - Include: `userId`, `jti: uuid.v4()`, `purpose: 'mfa_verification'`
+            - Sign with `JWT_ACCESS_SECRET` but use a very short TTL (5min)
+          - **Redis Binding (Single-use)**:
+            - Store `mfa-pending:{jti}` -> `userId` in Redis with TTL 5min
+            - This ensures the token is strictly single-use and cannot be used for any other purpose than the MFA verify route
+          - Return `{ mfaRequired: true, mfaToken: tempToken }` instead of full token pair
+          - DO NOT create a session yet
 
     3. Create `POST /auth/mfa/verify` endpoint:
-       - Accept { tempToken, otp }
-       - Verify temp token, extract userId
-       - Call mfa.verifyMfaOtp
-       - If valid: create full session + token pair (same as normal login completion)
-       - Delete mfa-pending from Redis
-       - Return { accessToken, refreshToken }
+        - Accept `{ mfaToken, otp }`
+        - **Verify Strategy**:
+          - Decode `mfaToken`, extract `userId` and `jti`
+          - Check if `mfa-pending:{jti}` exists in Redis. If not, throw UnauthorizedException.
+          - Call `mfa.verifyMfaOtp(userId, otp)`
+          - If valid:
+            - **Delete `mfa-pending:{jti}` from Redis** immediately (prevents replay)
+            - Continue with normal login completion (Plan 2.3 flow):
+              - Create MongoDB session (sessionId, userAgentHash, etc.)
+              - Generate full Access/Refresh token pair
+              - Update user `last_login_at`/`ip`
+              - Log audit (LOGIN_SUCCESS_MFA)
+            - Return token pair
+          - If invalid: Handle failed attempt counter in Redis (max 5)
 
     4. Additional endpoints:
        - POST /auth/mfa/enable — requires auth, returns secret + QR + backup codes
@@ -116,8 +128,9 @@ Implement password reset flow (token, email, update, session invalidation), emai
 </task>
 
 ## Success Criteria
-- [ ] Password reset generates token, validates it, updates password, invalidates all sessions
+- [ ] Password reset generates token, validates it, updates password, increments `token_version`, and invalidates all sessions
 - [ ] Email verification token generated on registration, verified via endpoint
 - [ ] MFA enable returns TOTP secret + backup codes
-- [ ] Login with MFA returns temp token, requires OTP verification for full access
+- [ ] Login with MFA returns single-use `mfaToken` bound to Redis with unique JTI
+- [ ] MFA verification consumes Redis entry and issues full session on success
 - [ ] Failed MFA attempts tracked and locked after 5 failures
