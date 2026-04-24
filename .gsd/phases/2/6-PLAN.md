@@ -25,9 +25,19 @@ Implement Google OAuth SSO, comprehensive audit logging service, and final secur
     1. Create `oauth.service.ts`:
        - Inject Google OAuth2Client with GOOGLE_CLIENT_ID from env
 
-       - `authenticateWithGoogle(idToken, deviceInfo)`:
-         - Verify Google ID token using google-auth-library
-         - Extract email, name, googleId from payload
+        - `authenticateWithGoogle(idToken, deviceInfo)`:
+          - **Strict Verification**: Verify ID token using `google-auth-library`'s `verifyIdToken`:
+            ```typescript
+            const ticket = await client.verifyIdToken({
+              idToken,
+              audience: [process.env.GOOGLE_CLIENT_ID], // CRITICAL: validate audience
+            });
+            const payload = ticket.getPayload();
+            if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') {
+              throw new UnauthorizedException('Invalid issuer'); // CRITICAL: validate issuer
+            }
+            ```
+          - Extract email, name, googleId from payload
          - Check if user exists by google_id:
            a) If exists: login flow (create session, generate tokens)
            b) If not exists but email exists: LINK accounts (set google_id on existing user)
@@ -60,10 +70,15 @@ Implement Google OAuth SSO, comprehensive audit logging service, and final secur
     1. Create `audit.service.ts`:
        - Injectable service using AuditLog Mongoose model
 
-       - `log(params: AuditLogParams)`:
-         - Accepts: userId, action (from AuditAction enum), metadata, ip, userAgent
-         - Creates AuditLog document in MongoDB
-         - Fire-and-forget (don't await — non-blocking logging)
+        - `log(params: AuditLogParams)`:
+          - Accepts: userId, action (from AuditAction enum), metadata, ip, userAgent
+          - **Reliability First**: MUST NOT silently fail.
+          - **Step 1**: Use `await` when saving the document to MongoDB.
+          - **Step 2**: Wrap in `try/catch`. If MongoDB write fails:
+            - Log the failure to NestJS Logger (`this.logger.error`).
+            - Fallback: Write the audit log to a local structured JSON log file (using `pino` or `winston` file transport).
+            - This ensures security logs are never lost even if the database is temporarily unreachable.
+          - DO NOT use fire-and-forget for critical security events (login, theft detection, password resets).
 
        - AuditAction enum:
          - LOGIN_SUCCESS, LOGIN_FAILURE, LOGOUT, LOGOUT_ALL_DEVICES
@@ -126,8 +141,10 @@ Implement Google OAuth SSO, comprehensive audit logging service, and final secur
 </task>
 
 ## Success Criteria
-- [ ] Google OAuth SSO with account creation/linking
-- [ ] Centralized audit logging used across all auth operations
+- [ ] Google OAuth SSO validates `audience` and `issuer` strictly
+- [ ] Account creation/linking works via Google SSO
+- [ ] Centralized audit logging is awaited, ensuring no silent failures
+- [ ] Audit service has error handling + fallback for MongoDB failure
 - [ ] Security hardening: sanitization, error handling, secure cookies
 - [ ] API Gateway integrates guards and proxies to auth service
 - [ ] Health check endpoint verifies all DB connections
