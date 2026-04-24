@@ -7,7 +7,7 @@ wave: 1
 # Plan 2.1: Infrastructure + Auth Module Skeleton
 
 ## Objective
-Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration, shared libs for database connections and Redis, and the base auth module structure inside `user-auth-service`.
+Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration with Joi/Zod validation, shared libs for database connections and Redis (with connection retry), global ConfigModule, structured logging, health check endpoint, and the base auth module structure inside `user-auth-service`.
 
 ## Context
 - .gsd/SPEC.md
@@ -17,88 +17,181 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration,
 ## Tasks
 
 <task type="auto">
-  <name>Create Docker Compose and .env infrastructure</name>
-  <files>docker-compose.yml, .env, .env.example, .gitignore</files>
+  <name>Create Docker Compose, .env with validation, and global ConfigModule</name>
+  <files>docker-compose.yml, .env, .env.example, .gitignore, libs/shared/src/config/env.validation.ts, libs/shared/src/config/config.module.ts</files>
   <action>
-    Create `docker-compose.yml` at workspace root with:
-    - PostgreSQL 15-alpine on port 5432, healthcheck with pg_isready
-    - MongoDB 6-jammy on port 27017, root auth enabled
-    - Redis 7-alpine on port 6379, requirepass enabled
-    - Named volumes for data persistence
+    Install: `pnpm add joi @nestjs/config`
 
-    Create `.env` at root with ALL secrets:
-    - POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_HOST, POSTGRES_PORT
-    - MONGO_USER, MONGO_PASSWORD, MONGO_DB, MONGO_HOST, MONGO_PORT
-    - REDIS_PASSWORD, REDIS_HOST, REDIS_PORT
-    - JWT_ACCESS_SECRET, JWT_REFRESH_SECRET, JWT_ACCESS_EXPIRATION=15m, JWT_REFRESH_EXPIRATION=7d
-    - UNIVERSITY_EMAIL_DOMAIN=university.edu
+    1. Create `docker-compose.yml` at workspace root with:
+       - PostgreSQL 15-alpine on port 5432, healthcheck with pg_isready
+       - MongoDB 6-jammy on port 27017, root auth enabled
+       - Redis 7-alpine on port 6379, requirepass enabled
+       - Named volumes for data persistence
+       - restart: unless-stopped on all services
 
-    Create `.env.example` mirroring .env with placeholder values.
-    Ensure `.env` is in `.gitignore` (add it if missing).
+    2. Create `.env` at root with ALL secrets:
+       - NODE_ENV=development
+       - POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_HOST, POSTGRES_PORT
+       - MONGO_USER, MONGO_PASSWORD, MONGO_DB, MONGO_HOST, MONGO_PORT
+       - REDIS_PASSWORD, REDIS_HOST, REDIS_PORT
+       - JWT_ACCESS_SECRET, JWT_REFRESH_SECRET, JWT_ACCESS_EXPIRATION=15m, JWT_REFRESH_EXPIRATION=7d
+       - UNIVERSITY_EMAIL_DOMAIN=university.edu
+       - CORS_ORIGINS=http://localhost:3000
+       - LOG_LEVEL=debug
+
+    3. Create `.env.example` mirroring .env with placeholder values (NO real secrets).
+
+    4. Ensure `.env` is in `.gitignore` (add if missing).
+
+    5. Create `libs/shared/src/config/env.validation.ts`:
+       - Use Joi to define a STRICT validation schema for ALL env vars
+       - Every var must be validated: string, number, enum (NODE_ENV), required
+       - FAIL FAST on startup if any env var is missing or invalid
+       - Export the validationSchema
+
+    6. Create `libs/shared/src/config/config.module.ts`:
+       - A global NestJS module wrapping ConfigModule.forRoot with:
+         - isGlobal: true
+         - envFilePath: path.resolve to workspace root .env
+         - validationSchema from env.validation.ts
+         - validationOptions: { abortEarly: true, allowUnknown: true }
+       - Export this as `AppConfigModule` for all services to import once in their root AppModule
   </action>
   <verify>docker compose config --quiet 2>&1; if ($LASTEXITCODE -eq 0) { "PASS" } else { "docker not available — config file valid by inspection" }</verify>
-  <done>.env exists with all secrets, docker-compose.yml is valid YAML, .env is gitignored.</done>
+  <done>.env exists. Joi validation schema rejects missing/malformed vars at startup. docker-compose.yml valid. .env gitignored.</done>
 </task>
 
 <task type="auto">
-  <name>Create shared database and Redis library</name>
+  <name>Create shared database and Redis library with production guards</name>
   <files>libs/shared/src/index.ts, libs/shared/src/database/postgres.module.ts, libs/shared/src/database/mongo.module.ts, libs/shared/src/redis/redis.module.ts, libs/shared/src/redis/redis.service.ts</files>
   <action>
     Generate an Nx library: `pnpm exec nx g @nx/js:lib shared --directory=libs/shared --importPath=@sabs/shared`
 
     Inside libs/shared/src create:
 
-    1. `database/postgres.module.ts` — A dynamic NestJS module wrapping TypeOrmModule.forRootAsync reading POSTGRES_* from ConfigService. Use `ssl: false` for local dev and `synchronize: true` for dev only (env-gated). Export the module.
+    1. `database/postgres.module.ts` — A dynamic NestJS module wrapping TypeOrmModule.forRootAsync:
+       - Read POSTGRES_* from ConfigService
+       - **CRITICAL**: `synchronize` MUST be gated by NODE_ENV:
+         ```typescript
+         synchronize: configService.get('NODE_ENV') === 'development',
+         // NEVER true in production — use migrations instead
+         ```
+       - ssl: configService.get('NODE_ENV') === 'production' ? { rejectUnauthorized: false } : false
+       - logging: configService.get('NODE_ENV') === 'development'
+       - autoLoadEntities: true
+       - retryAttempts: 5
+       - retryDelay: 3000
+       - Export the module.
 
-    2. `database/mongo.module.ts` — A dynamic NestJS module wrapping MongooseModule.forRootAsync building the connection URI from MONGO_* env vars via ConfigService. Export the module.
+    2. `database/mongo.module.ts` — A dynamic NestJS module wrapping MongooseModule.forRootAsync:
+       - Build connection URI from MONGO_* env vars via ConfigService
+       - connectionFactory: add error/connected event listeners for logging
+       - retryAttempts: 5
+       - retryDelay: 3000
+       - Export the module.
 
-    3. `redis/redis.module.ts` — A global NestJS module that provides a `REDIS_CLIENT` injection token. Use `ioredis` to create a Redis instance from REDIS_HOST, REDIS_PORT, REDIS_PASSWORD via ConfigService. Export the provider.
+    3. `redis/redis.module.ts` — A global NestJS module providing `REDIS_CLIENT` injection token:
+       - Use `ioredis` to create a Redis instance
+       - **Connection retry strategy** — configure `retryStrategy` in ioredis options:
+         ```typescript
+         retryStrategy(times: number) {
+           const delay = Math.min(times * 500, 5000); // exponential backoff, max 5s
+           logger.warn(`Redis reconnecting... attempt ${times}, delay ${delay}ms`);
+           if (times > 10) {
+             logger.error('Redis max retries reached. Giving up.');
+             return null; // stop retrying
+           }
+           return delay;
+         }
+         ```
+       - Add `error`, `connect`, `ready`, `close` event listeners with Logger
+       - enableReadyCheck: true
+       - maxRetriesPerRequest: 3
+       - Export the provider.
 
     4. `redis/redis.service.ts` — A service wrapping the Redis client with typed methods:
        - `get(key)`, `set(key, value, ttlSeconds?)`, `del(key)`, `exists(key)`
        - `setWithExpiry(key, value, ttlSeconds)` for token blacklisting
        - `increment(key)` and `expire(key, ttlSeconds)` for rate limiting
+       - `ping()` — for health checks, returns boolean
+       - Wrap all methods in try/catch with structured logging on failure
 
     5. `index.ts` — barrel export all modules and services.
 
     Update `tsconfig.base.json` paths to map `@sabs/shared` to `libs/shared/src/index.ts`.
   </action>
   <verify>pnpm exec nx build api-gateway</verify>
-  <done>Shared library compiles. @sabs/shared path alias resolves. Database and Redis modules are importable.</done>
+  <done>Shared library compiles. synchronize is env-gated. Redis has retry strategy. @sabs/shared path resolves.</done>
 </task>
 
 <task type="auto">
-  <name>Create auth module skeleton in user-auth-service</name>
-  <files>apps/user-auth-service/src/auth/auth.module.ts, apps/user-auth-service/src/auth/auth.controller.ts, apps/user-auth-service/src/auth/auth.service.ts, apps/user-auth-service/src/app/app.module.ts</files>
+  <name>Create auth module skeleton with health check and structured logging</name>
+  <files>apps/user-auth-service/src/auth/auth.module.ts, apps/user-auth-service/src/auth/auth.controller.ts, apps/user-auth-service/src/auth/auth.service.ts, apps/user-auth-service/src/health/health.controller.ts, apps/user-auth-service/src/health/health.module.ts, apps/user-auth-service/src/app/app.module.ts, apps/user-auth-service/src/main.ts</files>
   <action>
+    Install: `pnpm add @nestjs/terminus`
+
     Inside `apps/user-auth-service/src/` create:
 
-    1. `auth/auth.module.ts` — NestJS module importing ConfigModule.forRoot (isGlobal, envFilePath pointing to workspace root .env), PostgresModule, MongoModule, RedisModule from @sabs/shared. Declare AuthController and AuthService.
+    1. `health/health.controller.ts` — Health check endpoint:
+       - GET /health — @Public() decorated, no auth required
+       - Returns JSON with:
+         - status: 'ok' | 'error'
+         - postgres: connection state (use TypeORM DataSource.isInitialized)
+         - mongodb: connection state (use mongoose.connection.readyState)
+         - redis: connection state (use RedisService.ping())
+         - uptime: process.uptime()
+         - timestamp: new Date().toISOString()
+       - Use @nestjs/terminus HealthCheckService with TypeOrmHealthIndicator, MongooseHealthIndicator
+       - Return 200 if all healthy, 503 if any service down
 
-    2. `auth/auth.controller.ts` — Empty controller with placeholder routes:
+    2. `health/health.module.ts` — Module importing TerminusModule, TypeOrmModule, MongooseModule, RedisModule
+
+    3. `auth/auth.module.ts` — NestJS module importing:
+       - AppConfigModule from @sabs/shared (global config with env validation)
+       - PostgresModule, MongoModule, RedisModule from @sabs/shared
+       - Declare AuthController and AuthService
+
+    4. `auth/auth.controller.ts` — Empty controller with placeholder routes:
        - POST /auth/register
        - POST /auth/login
        - POST /auth/refresh
        - POST /auth/logout
        All returning `{ message: 'Not implemented' }` with 501 status.
+       - Use NestJS Logger for each request: `this.logger.log('Register request received')`
 
-    3. `auth/auth.service.ts` — Empty injectable service with method stubs matching each endpoint.
+    5. `auth/auth.service.ts` — Empty injectable service with method stubs matching each endpoint. Use NestJS Logger.
 
-    4. Update `app.module.ts` to import AuthModule. Remove default AppController and AppService if they only serve hello-world.
+    6. Update `app.module.ts`:
+       - Import AuthModule and HealthModule
+       - Remove default AppController and AppService if they only serve hello-world
 
-    5. Update `main.ts` to run as a HYBRID app — both HTTP (port 3001) and TCP microservice (port 3011). The HTTP side is needed for REST endpoints during development. Use:
-       ```
-       const app = await NestFactory.create(AppModule);
-       app.connectMicroservice({ transport: Transport.TCP, options: { port: 3011 } });
+    7. Update `main.ts` to run as a HYBRID app:
+       ```typescript
+       const app = await NestFactory.create(AppModule, {
+         logger: ['error', 'warn', 'log', 'debug', 'verbose'], // full logging in dev
+       });
+       app.connectMicroservice<MicroserviceOptions>({
+         transport: Transport.TCP,
+         options: { host: '0.0.0.0', port: 3011 },
+       });
        await app.startAllMicroservices();
        await app.listen(3001);
+       Logger.log('🚀 User Auth Service — HTTP :3001 | TCP :3011');
        ```
+       - Enable NestJS built-in Logger with service context labels
+       - In production: replace with Pino or Winston (TODO for later)
   </action>
   <verify>pnpm exec nx build user-auth-service</verify>
-  <done>user-auth-service builds. Auth module with placeholder endpoints exists. Service runs in hybrid HTTP+TCP mode.</done>
+  <done>user-auth-service builds. Health check at /health. Structured logging active. Auth module skeleton with stubs. Hybrid HTTP+TCP mode.</done>
 </task>
 
 ## Success Criteria
 - [ ] Docker Compose, .env, and .env.example exist with correct infrastructure
-- [ ] @sabs/shared library compiles and exports Postgres/Mongo/Redis modules
+- [ ] Joi env validation FAILS FAST if any required var is missing
+- [ ] synchronize is NEVER true in production (gated by NODE_ENV)
+- [ ] Redis has exponential backoff retry strategy with max 10 attempts
+- [ ] ConfigModule is global — imported once, available everywhere
+- [ ] GET /health returns postgres, mongodb, redis connection states
+- [ ] Structured logging with NestJS Logger in all services
+- [ ] @sabs/shared library compiles and exports all modules
 - [ ] user-auth-service builds with auth module skeleton and hybrid mode
