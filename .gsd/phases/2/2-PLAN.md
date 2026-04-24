@@ -90,18 +90,24 @@ Create the complete database schema for RBAC in PostgreSQL (users with soft dele
     Create Mongoose schemas:
 
     1. `session.schema.ts` — Collection `sessions`:
+       - **sessionId: string (UUID v4, unique, indexed)** — **CRITICAL**: The primary identifier for this session. This is what goes into the JWT refresh token payload (`sub: userId, sid: sessionId`). Using MongoDB's `_id` in JWTs leaks internal DB structure. A UUID is opaque, portable, and safe to expose in tokens. Generate via `uuid.v4()` on session creation.
        - userId: string (indexed)
-       - **tokenVersion: number** — mirrors the user's tokenVersion at time of session creation. On refresh, compare with current user.token_version. If stale, reject and force re-login. This catches: password changes, logout-all, and security events.
+       - **tokenVersion: number** — mirrors the user's tokenVersion at time of session creation. On refresh, compare with current user.token_version. If stale, reject and force re-login.
        - refreshTokenHash: string — **argon2 hash** of the refresh token (NOT bcrypt — argon2 is more resistant to GPU attacks)
        - **refreshTokenFamily: string** — UUID identifying the token chain. On rotation, new token inherits the family. If a token from the same family is reused after rotation, ALL sessions in that family are revoked (token theft detection).
        - deviceInfo: embedded object:
-         - userAgent: string
+         - userAgent: string — raw user-agent string (for display in "active sessions" UI)
+         - **userAgentHash: string** — SHA-256 hash of the user-agent. On every refresh request, hash the incoming user-agent and compare to stored hash. If mismatch, the token may have been stolen and replayed from a different browser/device. Action: log audit (SESSION_FINGERPRINT_MISMATCH), optionally revoke session depending on security policy. This is a lightweight session-binding mechanism.
+           ```typescript
+           import { createHash } from 'crypto';
+           const userAgentHash = createHash('sha256').update(userAgent).digest('hex');
+           ```
          - ip: string
          - device: string (parsed from user-agent — e.g. 'Chrome 120 / Windows 11')
          - **location: string (nullable)** — geo-approximation from IP (future enhancement)
        - isActive: boolean (default true)
        - **revokedAt: Date (nullable)** — when the session was explicitly revoked (null = active)
-       - **revokedReason: string (nullable)** — 'LOGOUT', 'LOGOUT_ALL', 'PASSWORD_CHANGE', 'TOKEN_THEFT', 'ADMIN_REVOKE'
+       - **revokedReason: string (nullable)** — 'LOGOUT', 'LOGOUT_ALL', 'PASSWORD_CHANGE', 'TOKEN_THEFT', 'ADMIN_REVOKE', 'FINGERPRINT_MISMATCH'
        - lastUsedAt: Date
        - expiresAt: Date — **TTL index confirmed:**
          ```typescript
@@ -113,23 +119,30 @@ Create the complete database schema for RBAC in PostgreSQL (users with soft dele
        - createdAt: Date
 
        **Indexes:**
-       - `{ userId: 1, isActive: 1 }` — compound index for "find active sessions for user"
-       - **Partial index for active sessions:**
+       - `{ sessionId: 1 }` — **unique index** — primary lookup for refresh token validation
+       - **Composite index for active user sessions:**
          ```typescript
-         @Schema({
-           collection: 'sessions',
-           timestamps: true,
-         })
-         // After schema creation, add partial index:
+         SessionSchema.index(
+           { userId: 1, isActive: 1, createdAt: -1 }
+         );
+         // Covers: "list all active sessions for user, newest first"
+         // This is the most frequent query (session list page, logout-all, token refresh)
+         ```
+       - **Partial index for active sessions only (storage-efficient):**
+         ```typescript
          SessionSchema.index(
            { userId: 1 },
            { partialFilterExpression: { isActive: true, revokedAt: null } }
          );
-         // This index is MUCH smaller than a full index because it only includes
-         // active sessions. Most sessions are expired/revoked, so this saves
-         // significant storage and query time.
+         // Much smaller than full index — most sessions are expired/revoked
          ```
-       - `{ refreshTokenFamily: 1 }` — for token theft detection (find all sessions in family)
+       - **Composite index for token family lookups:**
+         ```typescript
+         SessionSchema.index(
+           { refreshTokenFamily: 1, isActive: 1 }
+         );
+         // Covers: "find all active sessions in this token family" (theft detection)
+         ```
        - `{ expiresAt: 1 }` — TTL index (MongoDB auto-deletes)
 
     2. `login-attempt.schema.ts` — Collection `login_attempts`:
@@ -157,7 +170,7 @@ Create the complete database schema for RBAC in PostgreSQL (users with soft dele
     Register schemas in AuthModule using MongooseModule.forFeature.
   </action>
   <verify>pnpm exec nx build user-auth-service</verify>
-  <done>All Mongoose schemas compile. Session has tokenVersion + refreshTokenFamily. TTL index on expiresAt confirmed (expires: 0). Partial index on active sessions. Compound indexes optimized. Login attempts auto-cleanup at 24h.</done>
+  <done>All Mongoose schemas compile. Session has sessionId (UUID, unique). userAgentHash for session binding. tokenVersion + refreshTokenFamily. TTL index confirmed. Partial + composite indexes optimized. Login attempts auto-cleanup at 24h.</done>
 </task>
 
 <task type="auto">
@@ -197,11 +210,15 @@ Create the complete database schema for RBAC in PostgreSQL (users with soft dele
 - [ ] User entity has `last_login_at` and `last_login_ip` — updated on every successful login
 - [ ] `mfa_secret` is encrypted at rest with AES-256-GCM via EncryptionService in @sabs/shared
 - [ ] `mfa_backup_codes` stored as argon2 hashes, never plaintext
-- [ ] Session schema has `tokenVersion` mirroring user's version at creation time
-- [ ] Session schema has `refreshTokenFamily` for token theft detection across rotation chain
-- [ ] Session schema has `revokedAt` + `revokedReason` for explicit revocation tracking
+- [ ] Session has `sessionId` (UUID v4, unique index) — goes into JWT payload, never exposes MongoDB `_id`
+- [ ] Session has `userAgentHash` (SHA-256) — compared on refresh to detect token replay from different browser
+- [ ] Session has `tokenVersion` mirroring user's version at creation time
+- [ ] Session has `refreshTokenFamily` for token theft detection across rotation chain
+- [ ] Session has `revokedAt` + `revokedReason` for explicit revocation tracking
 - [ ] TTL index on `expiresAt` confirmed with `expires: 0` — MongoDB auto-deletes expired sessions
-- [ ] Partial index on `{ userId: 1 }` WHERE `isActive=true AND revokedAt=null` — smaller, faster index
+- [ ] Composite index `{ userId: 1, isActive: 1, createdAt: -1 }` for active session listing
+- [ ] Partial index on `{ userId: 1 }` WHERE `isActive=true AND revokedAt=null` — smaller, faster
+- [ ] Composite index `{ refreshTokenFamily: 1, isActive: 1 }` for theft detection
 - [ ] Login attempts have 24h TTL auto-cleanup
 - [ ] Audit logs include `correlationId` for distributed tracing
 - [ ] Seed service creates default RBAC data idempotently
