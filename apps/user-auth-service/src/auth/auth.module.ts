@@ -6,6 +6,7 @@ import { AuthService } from './auth.service';
 import { AppConfigModule, PostgresModule, MongoModule, RedisModule, EncryptionService, EncryptionTransformer } from '@sabs/shared';
 import { User, Role, Permission } from '../entities';
 import { Session, SessionSchema, LoginAttempt, LoginAttemptSchema, AuditLog, AuditLogSchema } from '../schemas';
+import { SeedService } from '../database/seed.service';
 
 @Module({
   imports: [
@@ -21,6 +22,6 @@ import { Session, SessionSchema, LoginAttempt, LoginAttemptSchema, AuditLog, Aud
     ])
   ],
   controllers: [AuthController],
-  providers: [AuthService, EncryptionService],
+  providers: [AuthService, EncryptionService, SeedService],
 })
 export class AuthModule {}
