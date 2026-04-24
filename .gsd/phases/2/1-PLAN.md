@@ -7,7 +7,7 @@ wave: 1
 # Plan 2.1: Infrastructure + Auth Module Skeleton
 
 ## Objective
-Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration with Joi/Zod validation, shared libs for database connections and Redis (with connection retry), global ConfigModule, structured logging, health check endpoint, and the base auth module structure inside `user-auth-service`.
+Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration with Joi validation, shared libs for database connections (with timeout/keepalive) and Redis (with connection retry + ping timeout), global ConfigModule, structured logging, health check endpoint, global validation pipe, request ID middleware, graceful shutdown hooks, and the base auth module structure inside `user-auth-service`.
 
 ## Context
 - .gsd/SPEC.md
@@ -81,6 +81,16 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
        - autoLoadEntities: true
        - retryAttempts: 5
        - retryDelay: 3000
+       - **Timeout + KeepAlive** — add `extra` options to prevent idle connection drops:
+         ```typescript
+         extra: {
+           connectionTimeoutMillis: 5000,   // fail fast if PG unreachable
+           idleTimeoutMillis: 30000,         // close idle connections after 30s
+           max: 20,                          // connection pool max
+           keepAlive: true,                  // TCP keepalive to prevent firewall drops
+           keepAliveInitialDelayMillis: 10000,
+         },
+         ```
        - Export the module.
 
     2. `database/mongo.module.ts` — A dynamic NestJS module wrapping MongooseModule.forRootAsync:
@@ -107,13 +117,31 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
        - Add `error`, `connect`, `ready`, `close` event listeners with Logger
        - enableReadyCheck: true
        - maxRetriesPerRequest: 3
+       - **connectTimeout: 5000** — fail fast if Redis is unreachable on startup
+       - **commandTimeout: 3000** — prevent hanging on slow Redis commands
        - Export the provider.
 
     4. `redis/redis.service.ts` — A service wrapping the Redis client with typed methods:
        - `get(key)`, `set(key, value, ttlSeconds?)`, `del(key)`, `exists(key)`
        - `setWithExpiry(key, value, ttlSeconds)` for token blacklisting
        - `increment(key)` and `expire(key, ttlSeconds)` for rate limiting
-       - `ping()` — for health checks, returns boolean
+       - `ping()` — for health checks with **timeout protection**:
+         ```typescript
+         async ping(): Promise<boolean> {
+           try {
+             const result = await Promise.race([
+               this.client.ping(),
+               new Promise((_, reject) =>
+                 setTimeout(() => reject(new Error('Redis ping timeout')), 2000)
+               ),
+             ]);
+             return result === 'PONG';
+           } catch (err) {
+             this.logger.error(`Redis ping failed: ${err.message}`);
+             return false;
+           }
+         }
+         ```
        - Wrap all methods in try/catch with structured logging on failure
 
     5. `index.ts` — barrel export all modules and services.
@@ -125,10 +153,11 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
 </task>
 
 <task type="auto">
-  <name>Create auth module skeleton with health check and structured logging</name>
-  <files>apps/user-auth-service/src/auth/auth.module.ts, apps/user-auth-service/src/auth/auth.controller.ts, apps/user-auth-service/src/auth/auth.service.ts, apps/user-auth-service/src/health/health.controller.ts, apps/user-auth-service/src/health/health.module.ts, apps/user-auth-service/src/app/app.module.ts, apps/user-auth-service/src/main.ts</files>
+  <name>Create auth module skeleton with health check, structured logging, validation pipe, request ID, and graceful shutdown</name>
+  <files>apps/user-auth-service/src/auth/auth.module.ts, apps/user-auth-service/src/auth/auth.controller.ts, apps/user-auth-service/src/auth/auth.service.ts, apps/user-auth-service/src/health/health.controller.ts, apps/user-auth-service/src/health/health.module.ts, libs/shared/src/middleware/request-id.middleware.ts, apps/user-auth-service/src/app/app.module.ts, apps/user-auth-service/src/main.ts</files>
   <action>
-    Install: `pnpm add @nestjs/terminus`
+    Install: `pnpm add @nestjs/terminus class-validator class-transformer uuid`
+    Install dev: `pnpm add -D @types/uuid`
 
     Inside `apps/user-auth-service/src/` create:
 
@@ -161,37 +190,77 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
 
     5. `auth/auth.service.ts` — Empty injectable service with method stubs matching each endpoint. Use NestJS Logger.
 
-    6. Update `app.module.ts`:
+    6. **Request ID Middleware** — Create `libs/shared/src/middleware/request-id.middleware.ts`:
+       - NestJS middleware implementing NestMiddleware
+       - On every request:
+         - Check for incoming `X-Request-ID` header (from upstream proxy/gateway)
+         - If missing, generate one using `uuid.v4()`
+         - Attach to `req.requestId` and set `X-Request-ID` response header
+         - Attach to NestJS Logger context so ALL logs for that request include the ID
+       - Export from @sabs/shared barrel
+       - Apply globally via `app.module.ts` using `configure(consumer) { consumer.apply(RequestIdMiddleware).forRoutes('*') }`
+
+    7. Update `app.module.ts`:
        - Import AuthModule and HealthModule
+       - Implement NestModule interface, apply RequestIdMiddleware globally
        - Remove default AppController and AppService if they only serve hello-world
 
-    7. Update `main.ts` to run as a HYBRID app:
+    8. Update `main.ts` — HYBRID app with **Global Validation Pipe** and **Graceful Shutdown**:
        ```typescript
        const app = await NestFactory.create(AppModule, {
-         logger: ['error', 'warn', 'log', 'debug', 'verbose'], // full logging in dev
+         logger: ['error', 'warn', 'log', 'debug', 'verbose'],
        });
+
+       // --- Global Validation Pipe ---
+       app.useGlobalPipes(new ValidationPipe({
+         whitelist: true,             // strip properties not in DTO
+         forbidNonWhitelisted: true,  // throw on unknown properties
+         transform: true,             // auto-transform payloads to DTO instances
+         transformOptions: {
+           enableImplicitConversion: true,
+         },
+         disableErrorMessages: process.env.NODE_ENV === 'production',
+       }));
+
+       // --- Microservice ---
        app.connectMicroservice<MicroserviceOptions>({
          transport: Transport.TCP,
          options: { host: '0.0.0.0', port: 3011 },
        });
+
+       // --- Graceful Shutdown ---
+       app.enableShutdownHooks();
+       // NestJS will call OnModuleDestroy/OnApplicationShutdown hooks
+       // on SIGTERM/SIGINT — this closes DB pools, Redis connections, etc.
+       process.on('SIGTERM', () => {
+         Logger.log('SIGTERM received — shutting down gracefully...', 'Bootstrap');
+       });
+       process.on('SIGINT', () => {
+         Logger.log('SIGINT received — shutting down gracefully...', 'Bootstrap');
+       });
+
        await app.startAllMicroservices();
        await app.listen(3001);
-       Logger.log('🚀 User Auth Service — HTTP :3001 | TCP :3011');
+       Logger.log('🚀 User Auth Service — HTTP :3001 | TCP :3011', 'Bootstrap');
        ```
-       - Enable NestJS built-in Logger with service context labels
-       - In production: replace with Pino or Winston (TODO for later)
   </action>
   <verify>pnpm exec nx build user-auth-service</verify>
-  <done>user-auth-service builds. Health check at /health. Structured logging active. Auth module skeleton with stubs. Hybrid HTTP+TCP mode.</done>
+  <done>user-auth-service builds. Health check at /health. Global ValidationPipe active. Request ID on every request. Graceful shutdown with enableShutdownHooks. Hybrid HTTP+TCP mode.</done>
 </task>
 
 ## Success Criteria
 - [ ] Docker Compose, .env, and .env.example exist with correct infrastructure
 - [ ] Joi env validation FAILS FAST if any required var is missing
 - [ ] synchronize is NEVER true in production (gated by NODE_ENV)
+- [ ] PostgreSQL has connectionTimeout (5s), idleTimeout (30s), keepAlive, pool max (20)
 - [ ] Redis has exponential backoff retry strategy with max 10 attempts
+- [ ] Redis has connectTimeout (5s) and commandTimeout (3s)
+- [ ] Redis ping() has 2s timeout protection — never hangs health checks
 - [ ] ConfigModule is global — imported once, available everywhere
 - [ ] GET /health returns postgres, mongodb, redis connection states
+- [ ] Global ValidationPipe strips unknown fields, throws on non-whitelisted, auto-transforms
+- [ ] Every request has X-Request-ID header (generated or forwarded)
+- [ ] Graceful shutdown via enableShutdownHooks() — closes DB pools and Redis on SIGTERM/SIGINT
 - [ ] Structured logging with NestJS Logger in all services
 - [ ] @sabs/shared library compiles and exports all modules
 - [ ] user-auth-service builds with auth module skeleton and hybrid mode
