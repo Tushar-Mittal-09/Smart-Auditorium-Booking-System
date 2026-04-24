@@ -153,11 +153,11 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
 </task>
 
 <task type="auto">
-  <name>Create auth module skeleton with health check, structured logging, validation pipe, request ID, and graceful shutdown</name>
-  <files>apps/user-auth-service/src/auth/auth.module.ts, apps/user-auth-service/src/auth/auth.controller.ts, apps/user-auth-service/src/auth/auth.service.ts, apps/user-auth-service/src/health/health.controller.ts, apps/user-auth-service/src/health/health.module.ts, libs/shared/src/middleware/request-id.middleware.ts, apps/user-auth-service/src/app/app.module.ts, apps/user-auth-service/src/main.ts</files>
+  <name>Create auth module skeleton with health check, metrics, security hardening, validation pipe, request ID, and graceful shutdown</name>
+  <files>apps/user-auth-service/src/auth/auth.module.ts, apps/user-auth-service/src/auth/auth.controller.ts, apps/user-auth-service/src/auth/auth.service.ts, apps/user-auth-service/src/health/health.controller.ts, apps/user-auth-service/src/health/health.module.ts, apps/user-auth-service/src/metrics/metrics.controller.ts, apps/user-auth-service/src/metrics/metrics.module.ts, libs/shared/src/middleware/request-id.middleware.ts, apps/user-auth-service/src/app/app.module.ts, apps/user-auth-service/src/main.ts</files>
   <action>
-    Install: `pnpm add @nestjs/terminus class-validator class-transformer uuid`
-    Install dev: `pnpm add -D @types/uuid`
+    Install: `pnpm add @nestjs/terminus class-validator class-transformer uuid helmet compression express-prom-bundle prom-client`
+    Install dev: `pnpm add -D @types/uuid @types/compression`
 
     Inside `apps/user-auth-service/src/` create:
 
@@ -190,26 +190,80 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
 
     5. `auth/auth.service.ts` — Empty injectable service with method stubs matching each endpoint. Use NestJS Logger.
 
-    6. **Request ID Middleware** — Create `libs/shared/src/middleware/request-id.middleware.ts`:
+    6. **Request ID / Correlation ID Middleware** — Create `libs/shared/src/middleware/request-id.middleware.ts`:
        - NestJS middleware implementing NestMiddleware
        - On every request:
          - Check for incoming `X-Request-ID` header (from upstream proxy/gateway)
+         - Also check `X-Correlation-ID` for distributed tracing across microservices
          - If missing, generate one using `uuid.v4()`
-         - Attach to `req.requestId` and set `X-Request-ID` response header
-         - Attach to NestJS Logger context so ALL logs for that request include the ID
+         - Attach to `req.requestId` and `req.correlationId`
+         - Set `X-Request-ID` and `X-Correlation-ID` response headers
+         - **Correlation ID in ALL logs**: Attach to NestJS Logger context so every log line for that request includes `[requestId=<uuid>]`
+         - When forwarding requests to other microservices, pass `X-Correlation-ID` header to maintain the trace chain
        - Export from @sabs/shared barrel
        - Apply globally via `app.module.ts` using `configure(consumer) { consumer.apply(RequestIdMiddleware).forRoutes('*') }`
 
-    7. Update `app.module.ts`:
-       - Import AuthModule and HealthModule
+    7. **Prometheus Metrics Endpoint** — Create `apps/user-auth-service/src/metrics/`:
+       - `metrics.controller.ts`:
+         - GET /metrics — @Public(), returns Prometheus-formatted text
+         - Uses `prom-client` default registry
+         - Exposes: http_request_duration_seconds, http_requests_total, nodejs_heap_size_bytes, etc.
+       - `metrics.module.ts` — imports prom-client
+       - In `main.ts`, register `express-prom-bundle` middleware:
+         ```typescript
+         import promBundle from 'express-prom-bundle';
+         app.use(promBundle({
+           includeMethod: true,
+           includePath: true,
+           includeStatusCode: true,
+           promClient: { collectDefaultMetrics: {} },
+         }));
+         ```
+       - This auto-collects HTTP request metrics with zero code changes per route
+
+    8. Update `app.module.ts`:
+       - Import AuthModule, HealthModule, and MetricsModule
        - Implement NestModule interface, apply RequestIdMiddleware globally
        - Remove default AppController and AppService if they only serve hello-world
 
-    8. Update `main.ts` — HYBRID app with **Global Validation Pipe** and **Graceful Shutdown**:
+    9. Update `main.ts` — HYBRID app with full production hardening:
        ```typescript
+       import helmet from 'helmet';
+       import compression from 'compression';
+       import { json, urlencoded } from 'express';
+       import promBundle from 'express-prom-bundle';
+
        const app = await NestFactory.create(AppModule, {
          logger: ['error', 'warn', 'log', 'debug', 'verbose'],
        });
+
+       // --- Security Headers (Helmet) ---
+       app.use(helmet({
+         contentSecurityPolicy: process.env.NODE_ENV === 'production',
+         crossOriginEmbedderPolicy: false, // allow embedding in dev
+       }));
+
+       // --- Compression (gzip) ---
+       app.use(compression({
+         threshold: 1024, // only compress responses > 1KB
+       }));
+
+       // --- Request Body Size Limit ---
+       app.use(json({ limit: '10kb' }));        // JSON payloads max 10KB
+       app.use(urlencoded({ extended: true, limit: '10kb' }));
+
+       // --- Global API Prefix ---
+       app.setGlobalPrefix('api/v1', {
+         exclude: ['health', 'metrics'], // health + metrics stay at root
+       });
+
+       // --- Prometheus Metrics Middleware ---
+       app.use(promBundle({
+         includeMethod: true,
+         includePath: true,
+         includeStatusCode: true,
+         promClient: { collectDefaultMetrics: {} },
+       }));
 
        // --- Global Validation Pipe ---
        app.useGlobalPipes(new ValidationPipe({
@@ -230,8 +284,6 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
 
        // --- Graceful Shutdown ---
        app.enableShutdownHooks();
-       // NestJS will call OnModuleDestroy/OnApplicationShutdown hooks
-       // on SIGTERM/SIGINT — this closes DB pools, Redis connections, etc.
        process.on('SIGTERM', () => {
          Logger.log('SIGTERM received — shutting down gracefully...', 'Bootstrap');
        });
@@ -242,10 +294,24 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
        await app.startAllMicroservices();
        await app.listen(3001);
        Logger.log('🚀 User Auth Service — HTTP :3001 | TCP :3011', 'Bootstrap');
+       Logger.log('📊 Metrics available at /metrics', 'Bootstrap');
+       Logger.log('💚 Health check at /health', 'Bootstrap');
        ```
+
+    10. **Circuit Breaker (Future-Ready)**:
+        - Add a TODO comment block in `libs/shared/src/resilience/README.md`:
+          ```
+          # Circuit Breaker — Future Implementation
+          When inter-service calls are added (API Gateway -> Auth, Auth -> Event, etc.),
+          implement circuit breaker using `opossum` or `@nestjs/axios` with interceptors.
+          Pattern: CLOSED -> OPEN (after N failures) -> HALF-OPEN (probe) -> CLOSED
+          This prevents cascading failures across microservices.
+          NOT implemented in Phase 2 — no inter-service calls yet.
+          ```
+        - This is a placeholder. Actual implementation happens when RabbitMQ/inter-service communication is added.
   </action>
   <verify>pnpm exec nx build user-auth-service</verify>
-  <done>user-auth-service builds. Health check at /health. Global ValidationPipe active. Request ID on every request. Graceful shutdown with enableShutdownHooks. Hybrid HTTP+TCP mode.</done>
+  <done>user-auth-service builds. Helmet + compression + 10KB body limit active. Global prefix api/v1. Health at /health, metrics at /metrics. Global ValidationPipe. Request ID + Correlation ID on every request/log. Graceful shutdown. Hybrid HTTP+TCP mode.</done>
 </task>
 
 ## Success Criteria
@@ -258,9 +324,16 @@ Create Docker Compose for PostgreSQL/MongoDB/Redis, secure `.env` configuration 
 - [ ] Redis ping() has 2s timeout protection — never hangs health checks
 - [ ] ConfigModule is global — imported once, available everywhere
 - [ ] GET /health returns postgres, mongodb, redis connection states
+- [ ] GET /metrics returns Prometheus-formatted metrics (request duration, counts, heap)
+- [ ] Helmet sets security headers (CSP, X-Frame-Options, etc.)
+- [ ] Compression enabled for responses > 1KB
+- [ ] Request body limited to 10KB (prevents payload DoS)
+- [ ] Global prefix api/v1 on all routes except /health and /metrics
 - [ ] Global ValidationPipe strips unknown fields, throws on non-whitelisted, auto-transforms
-- [ ] Every request has X-Request-ID header (generated or forwarded)
+- [ ] Every request has X-Request-ID + X-Correlation-ID headers (generated or forwarded)
+- [ ] Correlation ID appears in ALL log lines for distributed tracing
 - [ ] Graceful shutdown via enableShutdownHooks() — closes DB pools and Redis on SIGTERM/SIGINT
+- [ ] Circuit breaker documented as future TODO with implementation guide
 - [ ] Structured logging with NestJS Logger in all services
 - [ ] @sabs/shared library compiles and exports all modules
 - [ ] user-auth-service builds with auth module skeleton and hybrid mode
