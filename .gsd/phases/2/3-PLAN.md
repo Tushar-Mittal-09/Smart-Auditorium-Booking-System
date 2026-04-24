@@ -123,11 +123,30 @@ Implement complete registration (email domain validation, argon2 hashing, defaul
        - **STEP 2**: Find the session in MongoDB by `sessionId` (NOT by MongoDB _id).
        - **STEP 3 — Session validation checks** (in this exact order):
          ```
-         a) Session not found        → throw Unauthorized
+         a) Session not found        → throw Unauthorized (session deleted or never existed)
          b) session.isActive = false  → log REFRESH_TOKEN_REUSE, throw Unauthorized
          c) session.revokedAt != null → log REFRESH_TOKEN_REUSE, throw Unauthorized
-         d) session expired           → throw Unauthorized
+         d) session.expiresAt <= now  → EXPLICIT EXPIRATION CHECK — throw Unauthorized
          ```
+         **WHY STEP 3d is explicit and CRITICAL:**
+         MongoDB TTL monitor runs only every ~60 seconds. This means a session
+         document can exist in the database for up to 60s AFTER its expiresAt
+         has passed. If we rely solely on "document exists = valid", an attacker
+         with a stolen refresh token has a 60-second race window to use it
+         after expiration. The application layer MUST compare:
+         ```typescript
+         if (session.expiresAt <= new Date()) {
+           // Session is logically expired even though MongoDB hasn't deleted it yet
+           this.logger.warn(`Session ${sessionId} used after expiration (TTL race window)`);
+           // Deactivate immediately so it can't be tried again in the window
+           await this.sessionModel.updateOne(
+             { sessionId },
+             { isActive: false, revokedAt: new Date(), revokedReason: 'EXPIRED' }
+           );
+           throw new UnauthorizedException('Session expired');
+         }
+         ```
+         This makes the system airtight regardless of MongoDB's background cleanup timing.
        - **STEP 4 — tokenVersion check (CRITICAL)**:
          - Fetch the CURRENT user from PostgreSQL
          - Compare `jwt.tokenVersion` with `user.token_version`
@@ -190,6 +209,7 @@ Implement complete registration (email domain validation, argon2 hashing, defaul
 - [ ] Access token JWT includes: userId, email, roles, permissions, tokenVersion, jti
 - [ ] Refresh token JWT includes: userId, sessionId, tokenVersion, jti
 - [ ] Refresh validates tokenVersion — rejects if jwt.tokenVersion < user.token_version (stale)
+- [ ] Refresh explicitly checks session.expiresAt <= now — closes MongoDB TTL 60s race window
 - [ ] Refresh validates userAgentHash — detects browser fingerprint mismatch
 - [ ] Refresh validates refreshTokenHash — hash mismatch triggers family-wide revocation (token theft)
 - [ ] Logout-all increments user.token_version — instant global token invalidation
