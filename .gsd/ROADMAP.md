@@ -15,7 +15,9 @@
 - [ ] Personalized recommendation engine
 - [ ] Generative AI (LLM) & RAG chatbot
 - [ ] Agentic AI automation layer
+- [ ] Data pipeline & feature engineering
 - [ ] Observability & production hardening
+- [ ] DevOps & CI/CD pipeline
 
 ## Phases
 
@@ -73,14 +75,31 @@
 
 ---
 
-### Phase 8: Predictive Analytics & Fraud Detection
+### Phase 8: Data Pipeline & Feature Engineering
 **Status**: ⬜ Not Started
-**Objective**: Build the data science foundation — ML models for attendance prediction, no-show forecasting, peak booking analysis, and bot/fraud detection.
-**Depends on**: Phase 6 (Analytics dashboard), Phase 3 (Booking data)
-**Requirements**: AI-PA-01, AI-FD-01
+**Objective**: Build a robust data pipeline layer — Kafka/RabbitMQ event streaming, ETL processing (extract/transform/load), feature engineering (booking_frequency, attendance_rate, no_show_ratio, etc.), data versioning, and batch + streaming processing for ML-ready datasets.
+**Depends on**: Phase 3 (Booking data), Phase 7 (Search/Kafka infra)
+**Requirements**: AI-DP-01
 
 **Tasks**:
 - [ ] TBD (run /plan 8 to create)
+
+**Verification**:
+- Clean dataset generation pipeline end-to-end
+- Feature store available and queryable by ML models
+- Streaming data processing latency < 5s
+- Zero data loss under failure recovery tests
+
+---
+
+### Phase 9: Predictive Analytics & Fraud Detection
+**Status**: ⬜ Not Started
+**Objective**: Build the data science foundation — ML models for attendance prediction, no-show forecasting, peak booking analysis, and bot/fraud detection.
+**Depends on**: Phase 8 (Data Pipeline/Feature Store), Phase 6 (Analytics dashboard)
+**Requirements**: AI-PA-01, AI-FD-01
+
+**Tasks**:
+- [ ] TBD (run /plan 9 to create)
 
 **Verification**:
 - Attendance prediction accuracy > 85%
@@ -89,14 +108,14 @@
 
 ---
 
-### Phase 9: Recommendation Engine
+### Phase 10: Recommendation Engine
 **Status**: ⬜ Not Started
 **Objective**: Implement personalized event recommendations, seat suggestions (group seating optimization), and time-based recommendations using collaborative and content-based filtering.
-**Depends on**: Phase 8 (Analytics data), Phase 3 (Booking history)
+**Depends on**: Phase 9 (Analytics data), Phase 8 (Feature Store)
 **Requirements**: AI-REC-01
 
 **Tasks**:
-- [ ] TBD (run /plan 9 to create)
+- [ ] TBD (run /plan 10 to create)
 
 **Verification**:
 - Personalized recommendations served per user
@@ -105,14 +124,14 @@
 
 ---
 
-### Phase 10: Generative AI & RAG Chatbot
+### Phase 11: Generative AI & RAG Chatbot
 **Status**: ⬜ Not Started
 **Objective**: Integrate LLM capabilities — auto-generate event descriptions, build a RAG-powered chatbot that answers user queries using real event data, and provide query-based booking assistance.
-**Depends on**: Phase 7 (Search/Elasticsearch), Phase 9 (Recommendations)
+**Depends on**: Phase 7 (Search/Elasticsearch), Phase 10 (Recommendations)
 **Requirements**: AI-LLM-01, AI-RAG-01
 
 **Tasks**:
-- [ ] TBD (run /plan 10 to create)
+- [ ] TBD (run /plan 11 to create)
 
 **Verification**:
 - Event descriptions auto-generated from metadata
@@ -121,14 +140,14 @@
 
 ---
 
-### Phase 11: Agentic AI & Automation
+### Phase 12: Agentic AI & Automation
 **Status**: ⬜ Not Started
 **Objective**: Deploy autonomous AI agents — Booking Agent (auto-book seats), Organizer Agent (schedule optimization), and Admin Agent (anomaly detection/response) — using tool-calling and API orchestration.
-**Depends on**: Phase 10 (LLM), Phase 8 (Fraud/Analytics)
+**Depends on**: Phase 11 (LLM), Phase 9 (Fraud/Analytics)
 **Requirements**: AI-AGT-01
 
 **Tasks**:
-- [ ] TBD (run /plan 11 to create)
+- [ ] TBD (run /plan 12 to create)
 
 **Verification**:
 - Booking Agent completes end-to-end booking via natural language
@@ -137,17 +156,35 @@
 
 ---
 
-### Phase 12: Observability, Scalability & Production Hardening
+### Phase 13: Observability, Scalability & Production Hardening
 **Status**: ⬜ Not Started
 **Objective**: Production-ready infrastructure — Prometheus/Grafana monitoring, distributed tracing, circuit breakers, auto-scaling policies, CDN integration, and load testing validation.
 **Depends on**: All previous phases
 **Requirements**: NFR-01, NFR-02
 
 **Tasks**:
-- [ ] TBD (run /plan 12 to create)
+- [ ] TBD (run /plan 13 to create)
 
 **Verification**:
 - Prometheus metrics and Grafana dashboards live
 - Circuit breakers tested under failure conditions
 - Load test: 10k concurrent users with < 200ms API latency
 - 99.9% uptime target validated
+
+---
+
+### Phase 14: DevOps & CI/CD Pipeline
+**Status**: ⬜ Not Started
+**Objective**: Fully automated DevOps pipeline — CI/CD (lint/test/build/deploy), Dockerization with multi-stage builds, Kubernetes orchestration with auto-scaling and rolling deployments, Infrastructure as Code (Terraform), Nginx reverse proxy with SSL, secrets management, and DDoS protection.
+**Depends on**: Phase 13 (Observability/Monitoring)
+**Requirements**: NFR-03
+
+**Tasks**:
+- [ ] TBD (run /plan 14 to create)
+
+**Verification**:
+- Zero-downtime deployment validated
+- Auto-scaling triggers correctly on CPU/traffic thresholds
+- CI pipeline success rate > 95%
+- Deployment time < 5 minutes
+- Dev → Staging → Production promotion working

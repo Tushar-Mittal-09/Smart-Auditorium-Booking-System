@@ -23,3 +23,5 @@
 | **AI-AGT-01** | Agentic AI: Booking Agent, Organizer Agent, Admin Agent with tool-calling | PRD 5.5 | Pending |
 | **NFR-01** | Observability: Prometheus/Grafana monitoring, distributed tracing, structured logging | PRD 9 | Pending |
 | **NFR-02** | Scalability: horizontal scaling, CDN, circuit breakers, auto-scaling, 10k+ concurrent | PRD 9–10 | Pending |
+| **AI-DP-01** | Data pipeline: Kafka streaming, ETL, feature engineering, data versioning, batch + streaming | PRD 8.1 | Pending |
+| **NFR-03** | DevOps: CI/CD pipeline, Docker/K8s, IaC (Terraform), Nginx, secrets management, DDoS protection | PRD 13 | Pending |
