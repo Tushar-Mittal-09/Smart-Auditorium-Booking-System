@@ -6,3 +6,16 @@ export * from './redis/redis.service';
 export * from './middleware/request-id.middleware';
 export * from './crypto/encryption.service';
 export * from './crypto/encryption.transformer';
+
+export * from './interfaces/auth-user.interface';
+export * from './strategies/jwt.strategy';
+export * from './guards/jwt-auth.guard';
+export * from './guards/roles.guard';
+export * from './guards/permissions.guard';
+export * from './guards/rate-limit.guard';
+export * from './decorators/current-user.decorator';
+export * from './decorators/public.decorator';
+export * from './decorators/roles.decorator';
+export * from './decorators/permissions.decorator';
+export * from './decorators/auth.decorator';
+export * from './decorators/rate-limit.decorator';
