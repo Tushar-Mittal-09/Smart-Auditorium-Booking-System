@@ -27,4 +27,5 @@ export const validationSchema = Joi.object({
   ENCRYPTION_KEY: Joi.string().length(64).required().messages({
     'string.length': 'ENCRYPTION_KEY must be exactly 64 characters (32 bytes hex)',
   }),
+  STRICT_FINGERPRINT: Joi.string().valid('true', 'false').optional(),
 });

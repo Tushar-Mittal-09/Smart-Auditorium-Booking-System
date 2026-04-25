@@ -87,4 +87,18 @@ export class TokenService {
       secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
     });
   }
+
+  /**
+   * Generate a short-lived temp token for MFA verification flow.
+   * Contains only userId — no session/roles until MFA is confirmed (Plan 2.5).
+   */
+  generateMfaTempToken(user: User): string {
+    return this.jwtService.sign(
+      { userId: user.id, type: 'mfa_temp', jti: uuidv4() },
+      {
+        secret: this.configService.get<string>('JWT_ACCESS_SECRET'),
+        expiresIn: '5m',
+      },
+    );
+  }
 }
